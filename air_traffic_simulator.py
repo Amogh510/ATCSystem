@@ -12,6 +12,14 @@ import copy
 import cv2 # Make sure opencv-python is installed
 from streamlit_autorefresh import st_autorefresh
 
+# Add these imports near the top
+import os
+from langchain.agents import Tool, initialize_agent, AgentType
+from langchain_groq import ChatGroq
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain.memory import ConversationBufferMemory # Optional: For agents needing memory
+from dotenv import load_dotenv
+
 # --- Configuration ---
 REFRESH_INTERVAL = 1000 # 1 second
 DATA_FILE = "atc_state_no_gates_v3.pkl" # New filename for this version
@@ -109,6 +117,514 @@ def get_runway_departure_points(runway_data, climb_out_dist_km=CLIMB_OUT_DISTANC
     offset_dx = offset_px * math.cos(departure_angle_rad); offset_dy = offset_px * math.sin(departure_angle_rad)
     climb_out_x = dep_x + offset_dx; climb_out_y = dep_y - offset_dy
     return departure_threshold_pt, (int(climb_out_x), int(climb_out_y))
+
+# --- Agent Tools Definition ---
+# These functions will be wrapped by LangChain tools for the agents
+# They interact directly with the session state, using the data_lock
+
+def get_all_aircraft_info():
+    """Retrieves the current state of all aircraft in the simulation."""
+    with data_lock:
+        return copy.deepcopy(st.session_state.flights)
+
+def get_all_runway_info():
+    """Retrieves the current state of all runways."""
+    with data_lock:
+        return copy.deepcopy(st.session_state.runways)
+
+def set_waypoints(flight_id: str, waypoints: list[tuple[int, int]]):
+    """Sets or updates the waypoints for a specific flight.
+    This cancels any current landing/takeoff procedures and sets the flight status
+    to Following Waypoints.
+    """
+    if not isinstance(flight_id, str) or not flight_id:
+        return {"error": "Invalid flight_id provided."}
+    if not isinstance(waypoints, list):
+         return {"error": "Waypoints must be a list."}
+    valid_waypoints = []
+    for wp in waypoints:
+        if isinstance(wp, (list, tuple)) and len(wp) == 2:
+            try:
+                wp_x, wp_y = int(wp[0]), int(wp[1])
+                if 0 <= wp_x < MAP_WIDTH_PX and 0 <= wp_y < MAP_HEIGHT_PX:
+                    valid_waypoints.append((wp_x, wp_y))
+                else:
+                    return {"error": f"Waypoint ({wp_x},{wp_y}) is out of map bounds ({MAP_WIDTH_PX}x{MAP_HEIGHT_PX})."}
+            except (ValueError, TypeError):
+                return {"error": f"Invalid waypoint format: {wp}. Expected (x, y)."}
+        else:
+            return {"error": f"Invalid waypoint format: {wp}. Expected (x, y)."}
+
+    if not valid_waypoints:
+         return {"info": "No valid waypoints provided to set."} # Not necessarily an error if list was empty
+
+    with data_lock:
+        if flight_id not in st.session_state.flights:
+            return {"error": f"Flight {flight_id} not found."}
+
+        flight_data = st.session_state.flights[flight_id]
+        msg_prefix = f"Waypoints set for {flight_id}."
+        freed_resources = []
+
+        # Free runway if previously assigned for landing/takeoff
+        old_rwy = flight_data.get('target_runway')
+        if old_rwy and old_rwy in st.session_state.runways and st.session_state.runways[old_rwy].get('flight_id') == flight_id:
+            st.session_state.runways[old_rwy]['status'] = 'Available'
+            st.session_state.runways[old_rwy]['flight_id'] = None
+            freed_resources.append(f"Runway {old_rwy}")
+            print(f"INFO (SetWaypoints): Runway {old_rwy} freed by new waypoints for {flight_id}.")
+
+        # Update flight state
+        flight_data['waypoints'] = valid_waypoints
+        flight_data['current_waypoint_index'] = 0
+        flight_data['status'] = STATUS_FOLLOWING_WAYPOINTS
+        flight_data['speed'] = DEFAULT_FLIGHT_SPEED_KNOTS # Resume normal speed
+        flight_data['target_runway'] = None
+        flight_data['takeoff_clearance_time'] = None # Cancel takeoff timer
+
+        if freed_resources:
+            msg_prefix += f" ({', '.join(freed_resources)} freed)."
+
+        print(f"INFO (SetWaypoints): {msg_prefix}")
+        # Trigger save outside the tool, maybe after orchestrator runs
+        # save_data(st.session_state.flights, st.session_state.runways)
+        return {"success": msg_prefix}
+
+
+def initiate_landing(flight_id: str, runway_id: str):
+    """Directs an existing flight to land on a specified available runway."""
+    if not isinstance(flight_id, str) or not flight_id:
+        return {"error": "Invalid flight_id provided."}
+    if not isinstance(runway_id, str) or not runway_id:
+        return {"error": "Invalid runway_id provided."}
+
+    with data_lock:
+        if flight_id not in st.session_state.flights:
+            return {"error": f"Flight {flight_id} not found."}
+        if runway_id not in st.session_state.runways:
+            return {"error": f"Runway {runway_id} not found."}
+        if st.session_state.runways[runway_id].get('status') != 'Available':
+            return {"error": f"Runway {runway_id} is not available (Status: {st.session_state.runways[runway_id].get('status')}, Flight: {st.session_state.runways[runway_id].get('flight_id')})."}
+        if st.session_state.flights[flight_id].get('status') == STATUS_ON_GROUND:
+             return {"error": f"Flight {flight_id} is already On Ground."}
+        if st.session_state.flights[flight_id].get('status') == STATUS_PREPARING_TAKEOFF:
+             return {"error": f"Flight {flight_id} is preparing for takeoff."}
+        if st.session_state.flights[flight_id].get('status') == STATUS_DEPARTING:
+             return {"error": f"Flight {flight_id} is currently departing."}
+
+
+        flight_data = st.session_state.flights[flight_id]
+        new_runway_data = st.session_state.runways[runway_id]
+        freed_resources=[]
+
+        # Free previous runway if assigned
+        old_rwy = flight_data.get('target_runway')
+        if old_rwy and old_rwy != runway_id and old_rwy in st.session_state.runways and st.session_state.runways[old_rwy].get('flight_id') == flight_id:
+            st.session_state.runways[old_rwy]['status'] = 'Available'
+            st.session_state.runways[old_rwy]['flight_id'] = None
+            freed_resources.append(f"Runway {old_rwy}")
+            print(f"INFO (InitiateLanding): Runway {old_rwy} freed by assigning {flight_id} to {runway_id}.")
+
+        # Calculate Landing Waypoints (Slowdown + Threshold ONLY)
+        slowdown_pt = get_runway_slowdown_point(new_runway_data)
+        thresh_pt, _ = calculate_endpoint(new_runway_data['x'], new_runway_data['y'], new_runway_data['length_px'], new_runway_data['angle_deg'])
+
+        # Update flight state
+        flight_data['waypoints'] = [slowdown_pt, thresh_pt]
+        flight_data['current_waypoint_index'] = 0
+        flight_data['status'] = STATUS_APPROACHING
+        flight_data['speed'] = APPROACH_SPEED_KNOTS # Start approach fast
+        flight_data['target_runway'] = runway_id
+        flight_data['takeoff_clearance_time'] = None # Clear any takeoff timer
+
+        # Occupy runway
+        new_runway_data['status'] = 'Occupied'
+        new_runway_data['flight_id'] = flight_id
+
+        msg = f"Directing {flight_id} to land on {runway_id}."
+        if freed_resources:
+            msg += f" ({', '.join(freed_resources)} freed)."
+
+        print(f"INFO (InitiateLanding): {msg}")
+        # Trigger save outside the tool
+        # save_data(st.session_state.flights, st.session_state.runways)
+        return {"success": msg}
+
+def initiate_takeoff(flight_id: str, runway_id: str):
+    """Commands a flight currently 'On Ground' to take off from a specified available runway."""
+    if not isinstance(flight_id, str) or not flight_id:
+        return {"error": "Invalid flight_id provided."}
+    if not isinstance(runway_id, str) or not runway_id:
+        return {"error": "Invalid runway_id provided."}
+
+    with data_lock:
+        if flight_id not in st.session_state.flights:
+            return {"error": f"Flight {flight_id} not found."}
+        if runway_id not in st.session_state.runways:
+            return {"error": f"Runway {runway_id} not found."}
+        if st.session_state.flights[flight_id].get('status') != STATUS_ON_GROUND:
+            return {"error": f"Flight {flight_id} is not 'On Ground' (Status: {st.session_state.flights[flight_id].get('status')})."}
+        if st.session_state.runways[runway_id].get('status') != 'Available':
+            return {"error": f"Runway {runway_id} is not available (Status: {st.session_state.runways[runway_id].get('status')}, Flight: {st.session_state.runways[runway_id].get('flight_id')})."}
+
+        flight_data = st.session_state.flights[flight_id]
+        runway_data = st.session_state.runways[runway_id]
+
+        # Occupy runway
+        runway_data['status'] = 'Occupied'
+        runway_data['flight_id'] = flight_id
+
+        # Get departure threshold point and position the aircraft there
+        dep_thresh_pt, _ = get_runway_departure_points(runway_data) # We only need the threshold point for positioning
+        dep_x, dep_y = dep_thresh_pt
+
+        # Update flight state for takeoff prep
+        flight_data['status'] = STATUS_PREPARING_TAKEOFF
+        flight_data['speed'] = 0.0
+        flight_data['altitude'] = 0.0
+        flight_data['x'] = float(dep_x) # Position at departure end
+        flight_data['y'] = float(dep_y)
+        flight_data['target_runway'] = runway_id
+        flight_data['takeoff_clearance_time'] = time.time() # Start the delay timer
+        flight_data['waypoints'] = [] # Clear any previous waypoints
+        flight_data['current_waypoint_index'] = -1
+        # Direction will be set when STATUS_DEPARTING begins in update_flight_positions
+
+        msg = f"Flight {flight_id} preparing for takeoff from {runway_id} ({TAKEOFF_DELAY_SECONDS}s delay)."
+        print(f"INFO (InitiateTakeoff): {msg}")
+        # Trigger save outside the tool
+        # save_data(st.session_state.flights, st.session_state.runways)
+        return {"success": msg}
+
+# --- End of Agent Tools Definition ---
+
+
+# --- Agent Setup ---
+
+@st.cache_resource # Cache the results of this function
+def initialize_agents_and_llm():
+    """Initializes the LLM, tools, and agents once and caches them."""
+    print("--- Running Agent Initialization (should only happen once) ---")
+    initialized_resources = {
+        "llm": None,
+        "tools": [],
+        "scheduler_agent": None,
+        "conflict_agent": None
+    }
+
+    # 1. Initialize LLM
+    try:
+        # load_dotenv() should have been called outside this function already
+        llm = ChatGroq(temperature=0.1, model_name="llama3-70b-8192")
+        print("Groq LLM Initialized.")
+        initialized_resources["llm"] = llm
+    except Exception as e:
+        st.error(f"Failed to initialize Groq LLM: {e}. Is GROQ_API_KEY set?")
+        print(f"ERROR: Failed to initialize Groq LLM: {e}")
+        # Return partially initialized resources so app can maybe still run parts
+        return initialized_resources
+
+    # 2. Define LangChain Tools
+    current_tools = [
+         Tool(
+            name="GetAllAircraftInfo",
+            func=lambda _: get_all_aircraft_info(),
+            description="Retrieves the current state (position, altitude, speed, status, waypoints, target runway) of all aircraft in the simulation.",
+        ),
+        Tool(
+            name="GetAllRunwayInfo",
+            func=lambda _: get_all_runway_info(),
+            description="Retrieves the current state (status, occupying flight ID) of all runways.",
+        ),
+        Tool(
+            name="SetWaypoints",
+            func=lambda args: set_waypoints(flight_id=args.get('flight_id'), waypoints=args.get('waypoints')),
+            description="Sets or updates the waypoints for a specific flight (flight_id: str, waypoints: list[tuple[int, int]]). Cancels any landing/takeoff and sets status to Following Waypoints.",
+        ),
+        Tool(
+            name="InitiateLanding",
+            func=lambda args: initiate_landing(flight_id=args.get('flight_id'), runway_id=args.get('runway_id')),
+            description="Directs an existing non-departing/non-ground flight (flight_id: str) to land on a specified AVAILABLE runway (runway_id: str). Sets status to Approaching and assigns landing waypoints.",
+        ),
+        Tool(
+            name="InitiateTakeoff",
+            func=lambda args: initiate_takeoff(flight_id=args.get('flight_id'), runway_id=args.get('runway_id')),
+            description="Commands a flight currently 'On Ground' (flight_id: str) to take off from a specified AVAILABLE runway (runway_id: str). Sets status to Preparing for Takeoff.",
+        ),
+    ]
+    print(f"LangChain Tools Defined: {[tool.name for tool in current_tools]}")
+    initialized_resources["tools"] = current_tools
+
+    # 3. Initialize Agents
+    # -- Scheduler Agent --
+    # NOTE: Keep the original multiline string prompt definitions here
+    scheduler_prompt_template = """You are an expert Air Traffic Control Scheduler. Your goal is to manage landings and takeoffs efficiently and safely using the available runways.
+
+    Available Tools:
+    {tools}
+
+    Current Airspace State:
+    {input}
+
+    Thought Process:
+    1. Analyze the current aircraft and runway states provided in the input.
+    2. Identify available runways.
+    3. Identify flights requesting or suitable for landing (Status: En Route, Following Waypoints near the airport - let's assume any non-approaching/departing/ground flight is potentially eligible).
+    4. Identify flights ready for takeoff (Status: On Ground).
+    5. Prioritize landing requests if runways are available. If multiple flights want to land, pick one (e.g., the first one listed for simplicity).
+    6. If no landings are pending/possible but takeoffs are ready and a runway is free, schedule a takeoff.
+    7. If a flight needs to land but no runway is available, consider putting it in a holding pattern by assigning waypoints. A simple holding pattern can be two waypoints forming a small loop near its current position (e.g., current_pos -> point A -> current_pos). Calculate suitable coordinates for point A (e.g., 5km North).
+    8. You can only issue ONE landing or ONE takeoff command per cycle using InitiateLanding or InitiateTakeoff.
+    9. You can issue multiple SetWaypoints commands if needed for holding patterns.
+    10. ONLY use the provided tools. Do not make up information. Provide the required arguments exactly (flight_id as string, runway_id as string, waypoints as list of tuples).
+    11. Respond with your action or state that no action is needed. Use the tools to perform actions.
+
+    Begin!
+
+    {agent_scratchpad}
+    """
+    SCHEDULER_PROMPT = ChatPromptTemplate.from_messages(
+        [
+            ("system", scheduler_prompt_template),
+            ("human", "{input}"),
+            MessagesPlaceholder(variable_name="agent_scratchpad"),
+        ]
+    )
+    try:
+        scheduler_agent = initialize_agent(
+            tools=current_tools, llm=llm, agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
+            prompt=SCHEDULER_PROMPT, verbose=True, handle_parsing_errors=True,
+        )
+        print("Scheduler Agent Initialized.")
+        initialized_resources["scheduler_agent"] = scheduler_agent
+    except Exception as e:
+        print(f"Error initializing Scheduler Agent: {e}")
+        st.error(f"Failed to initialize Scheduler Agent: {e}")
+
+    # -- Conflict Resolution Agent --
+    # NOTE: Keep the original multiline string prompt definition here
+    conflict_prompt_template = """You are an expert Air Traffic Control Conflict Resolution specialist. Your goal is to prevent aircraft from getting too close to each other (loss of separation). Assume minimum safe separation is 150 pixels horizontally OR 1000 feet vertically.
+
+    Available Tools:
+    {tools}
+
+    Current Airspace State:
+    {input}
+
+    Thought Process (Chain-of-Thought):
+    1. Analyze the current state of all active flights (not On Ground or Preparing Takeoff).
+    2. For each pair of active flights, calculate the current horizontal distance (in pixels) and vertical distance (in feet).
+    3. Predict potential conflicts: Check if any pair is currently closer than 150px horizontally AND closer than 1000ft vertically. (Focus on current separation for now, prediction is complex).
+    4. If a potential conflict is detected between Flight A and Flight B:
+        a. Identify the flights involved (flight_id).
+        b. Note their current positions, altitudes, and statuses.
+        c. Decide on a resolution strategy. The simplest is to vector (turn) one of the aircraft slightly using SetWaypoints. Choose the aircraft that is NOT currently landing or taking off, if possible.
+        d. Calculate a safe vector: Assign a single waypoint slightly off the current aircraft's track (e.g., 5km ahead and 30 degrees to the right of its current heading). Calculate the (x, y) coordinates for this waypoint.
+        e. Use the SetWaypoints tool to issue the vector to the chosen aircraft. Provide flight_id and the calculated waypoint as a list containing one tuple: `[(x, y)]`.
+    5. Handle only ONE conflict per cycle. If multiple conflicts exist, resolve the most critical (closest pair) first and stop.
+    6. If no conflicts are detected, state that clearly.
+    7. ONLY use the provided tools. Do not make up information. Ensure arguments are correct.
+
+    Begin!
+
+    {agent_scratchpad}
+    """
+    CONFLICT_PROMPT = ChatPromptTemplate.from_messages(
+         [
+            ("system", conflict_prompt_template),
+            ("human", "{input}"),
+            MessagesPlaceholder(variable_name="agent_scratchpad"),
+        ]
+    )
+    try:
+        conflict_agent = initialize_agent(
+            tools=current_tools, llm=llm, agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
+            prompt=CONFLICT_PROMPT, verbose=True, handle_parsing_errors=True,
+        )
+        print("Conflict Resolution Agent Initialized.")
+        initialized_resources["conflict_agent"] = conflict_agent
+    except Exception as e:
+        print(f"Error initializing Conflict Agent: {e}")
+        st.error(f"Failed to initialize Conflict Agent: {e}")
+
+    # Communication agent setup remains minimal as it uses direct LLM call
+    print("Communication Agent will use direct LLM call (no specific init needed here).")
+
+    print("--- Agent Initialization Complete ---")
+    return initialized_resources
+
+# Call the cached function ONCE
+agent_resources = initialize_agents_and_llm()
+
+
+# --- Orchestrator Function (now split) ---
+
+def _agent_cycle_thread_target(agent_resources):
+    """Target function for the background agent execution thread."""
+    print("\n--- Background Agent Cycle Started ---")
+    # Access resources from the passed dictionary
+    llm = agent_resources.get("llm")
+    scheduler_agent = agent_resources.get("scheduler_agent")
+    conflict_agent = agent_resources.get("conflict_agent")
+    # Check if agents/llm are None before trying to use them
+    if not llm or not scheduler_agent or not conflict_agent:
+         print("AgentThread: ERROR - Required agent resources not initialized. Exiting cycle.")
+         comm_message = "ERROR: Agents not initialized."
+         with data_lock:
+             st.session_state.agent_status_message = comm_message
+             st.session_state.agent_cycle_running = False
+         return
+
+    action_details = {}
+    action_taken_this_cycle = False
+    comm_message = "Agent cycle running..." # Default message
+
+    try: # Wrap the entire cycle for broad error catching
+        # 1. Get Current State
+        print("AgentThread: Getting current state...")
+        current_aircraft_info = get_all_aircraft_info()
+        current_runway_info = get_all_runway_info()
+
+        if not current_aircraft_info:
+            print("AgentThread: No aircraft detected. Exiting cycle.")
+            comm_message = "No aircraft; agents idle."
+            with data_lock: st.session_state.agent_status_message = comm_message
+            return # Exit thread
+
+        current_state_summary = f"Current Time: {time.time():.0f}\nAircraft: {current_aircraft_info}\nRunways: {current_runway_info}"
+        print(f"AgentThread: Current State Snapshot:\n{current_state_summary}")
+
+        # --- 2. Run Scheduler Agent ---
+        print("AgentThread: Running SCHEDULER Agent...")
+        # Use the scheduler_agent variable obtained from agent_resources
+        scheduler_input_dict = {"input": current_state_summary}
+        try:
+            scheduler_response = scheduler_agent.invoke(scheduler_input_dict)
+            scheduler_output = scheduler_response.get('output', '')
+            print(f"Scheduler Agent Raw Output: {scheduler_output}")
+            # --- Parsing logic (same as before) ---
+            if "InitiateLanding successfully" in scheduler_output or "Successfully directed" in scheduler_output:
+                parts = scheduler_output.split()
+                try:
+                    flight_id = parts[parts.index("landing") - 1]
+                    runway_id = parts[parts.index("on") + 1].replace('.','')
+                    action_details[flight_id] = f"cleared approach runway {runway_id}"
+                    action_taken_this_cycle = True
+                except (ValueError, IndexError): action_details["Scheduler"] = "Initiated landing (details unclear)"; action_taken_this_cycle = True
+            elif "InitiateTakeoff successfully" in scheduler_output or "preparing for takeoff" in scheduler_output:
+                parts = scheduler_output.split()
+                try:
+                    flight_id = parts[parts.index("takeoff") - 1]
+                    runway_id = parts[parts.index("from") + 1].replace('.','')
+                    action_details[flight_id] = f"cleared for takeoff runway {runway_id}"
+                    action_taken_this_cycle = True
+                except (ValueError, IndexError): action_details["Scheduler"] = "Initiated takeoff (details unclear)"; action_taken_this_cycle = True
+            elif "SetWaypoints successfully" in scheduler_output or "Waypoints set for" in scheduler_output:
+                parts = scheduler_output.split()
+                try:
+                     flight_id = parts[parts.index("for") + 1].replace('.','')
+                     action_details[flight_id] = "assigned new waypoints (holding/vectoring)"
+                     action_taken_this_cycle = True
+                except (ValueError, IndexError): action_details["Scheduler"] = "Set waypoints (details unclear)"; action_taken_this_cycle = True
+            else: print("AgentThread: Scheduler agent did not report taking a major action.")
+        except Exception as e_sched: print(f"ERROR running Scheduler Agent: {e_sched}")
+
+        # --- 3. Run Conflict Resolution Agent ---
+        print("\nAgentThread: Getting updated state for Conflict Agent...")
+        current_aircraft_info = get_all_aircraft_info() # Re-get potentially updated state
+        current_runway_info = get_all_runway_info()
+        active_flights_count = sum(1 for data in current_aircraft_info.values() if data.get('status') not in [STATUS_ON_GROUND, STATUS_PREPARING_TAKEOFF])
+
+        if active_flights_count >= 2:
+            print("AgentThread: Running CONFLICT RESOLUTION Agent...")
+            # Use the conflict_agent variable obtained from agent_resources
+            conflict_state_summary = f"Current Time: {time.time():.0f}\nAircraft: {current_aircraft_info}\nRunways: {current_runway_info}"
+            conflict_input_dict = {"input": conflict_state_summary}
+            try:
+                conflict_response = conflict_agent.invoke(conflict_input_dict)
+                conflict_output = conflict_response.get('output', '')
+                print(f"Conflict Agent Raw Output: {conflict_output}")
+                 # --- Parsing logic (same as before) ---
+                if "SetWaypoints successfully" in conflict_output or "Waypoints set for" in conflict_output:
+                     parts = conflict_output.split()
+                     try:
+                         flight_id = parts[parts.index("for") + 1].replace('.','')
+                         if flight_id not in action_details:
+                             action_details[flight_id] = "vector for traffic separation"
+                             action_taken_this_cycle = True
+                     except (ValueError, IndexError):
+                          if "Conflict" not in action_details: action_details["Conflict"] = "Set waypoints for conflict (details unclear)"; action_taken_this_cycle = True
+                elif "No conflicts detected" in conflict_output: print("AgentThread: Conflict agent reported no conflicts.")
+                else: print("AgentThread: Conflict agent finished, but no clear action or no-conflict statement parsed.")
+            except Exception as e_conf: print(f"ERROR running Conflict Resolution Agent: {e_conf}")
+        elif active_flights_count < 2: print("AgentThread: Skipping conflict resolution (fewer than 2 active aircraft).")
+
+        # --- 4. Generate Communication ---
+        comm_message = "No actions taken by agents." # Default if no actions
+        if action_details:
+            print("\nAgentThread: Running COMMUNICATION Generation...")
+            communication_prompt_text = "You are an ATC communication specialist. Convert the following structured ATC actions into concise, realistic radio calls. Use standard phraseology. Address each flight individually.\n\nActions Taken:\n"
+            for flight_id, desc in action_details.items(): communication_prompt_text += f"- {flight_id}: {desc}\n"
+            communication_prompt_text += "\nGenerated Radio Calls:"
+            try:
+                # Use the llm variable obtained from agent_resources
+                communication_response = llm.invoke(communication_prompt_text)
+                if hasattr(communication_response, 'content'): final_comm = communication_response.content
+                else: final_comm = str(communication_response)
+                print(f"Communication LLM Raw Output: {final_comm}")
+                comm_message = f"Agent Communications:\n```\n{final_comm}\n```"
+            except Exception as e_comm:
+                print(f"ERROR running Communication LLM: {e_comm}")
+                fallback_comm = ["ATC Actions (Comm Gen Error):"] + [f"- {fid}: {desc}" for fid, desc in action_details.items()]
+                comm_message = f"Agent Communications (Fallback):\n```\n" + "\n".join(fallback_comm) + "\n```"
+        else:
+            print("AgentThread: No actions taken by agents, skipping communication generation.")
+
+        # --- 5. Save State ---
+        if action_taken_this_cycle:
+            print("\nAgentThread: Saving final state...")
+            save_data(st.session_state.flights, st.session_state.runways)
+            print("AgentThread: State saved.")
+        else:
+            print("\nAgentThread: No state changes detected by agents, skipping save.")
+
+    except Exception as e_cycle:
+         print(f"ERROR in background agent cycle: {e_cycle}")
+         comm_message = f"Agent cycle failed: {e_cycle}"
+
+    # Update session state for UI feedback *after* cycle completes or fails
+    with data_lock:
+        st.session_state.agent_status_message = comm_message
+        st.session_state.agent_cycle_running = False
+
+    print("--- Background Agent Cycle Finished ---")
+
+def run_atc_orchestrator(agent_resources):
+    """Starts the agent execution cycle in a background thread."""
+    if st.session_state.get('agent_cycle_running', False):
+         st.warning("Agent cycle is already running in the background.")
+         return
+
+    # Check if resources were initialized before starting thread
+    if not agent_resources or not agent_resources.get("llm"):
+         st.error("Cannot start agent cycle: LLM or essential resources failed to initialize.")
+         return
+
+    print("UI Thread: Received request to start agent cycle.")
+    st.session_state.agent_cycle_running = True
+    st.session_state.agent_status_message = "Agent cycle starting..."
+
+    # Pass agent_resources to the target function
+    agent_thread = threading.Thread(target=_agent_cycle_thread_target, args=(agent_resources,), daemon=True)
+    agent_thread.start()
+
+    print("UI Thread: Background agent thread started. UI remains responsive.")
+    st.info("ATC Agent cycle running in background... Refresh page periodically or check console logs. Status message will update below.")
+    # No st.rerun() here, let autorefresh handle UI updates or user interaction
+
+
+# --- End of Agent Setup ---
+
 
 # --- Background Flight Position Updater ---
 def update_flight_positions(flights_dict, runways_dict):
@@ -324,12 +840,36 @@ with col2: # Controls Column
         status = st.selectbox("Initial Status", [STATUS_EN_ROUTE, STATUS_DEPARTING])
         submitted = st.form_submit_button("Add Flight")
         if submitted:
-            if not flight_id: st.error("Flight ID required.")
-            elif flight_id in st.session_state.flights: st.error(f"Flight {flight_id} exists.")
+            print("DEBUG: Add Flight button clicked.")
+            if not flight_id:
+                st.error("Flight ID required.")
+                print("DEBUG: Flight ID missing.")
+            elif flight_id in st.session_state.get('flights', {}):
+                st.error(f"Flight {flight_id} exists.")
+                print(f"DEBUG: Flight {flight_id} already exists.")
             else:
+                print(f"DEBUG: Preparing new flight data for {flight_id}.")
                 new_flight_data = { 'speed': float(speed), 'direction': float(direction), 'x': float(x), 'y': float(y), 'altitude': float(altitude), 'status': status, 'waypoints': [], 'current_waypoint_index': -1, 'target_runway': None, 'takeoff_clearance_time': None }
-                with data_lock: st.session_state.flights[flight_id] = new_flight_data
-                st.success(f"Flight {flight_id} added."); save_data(st.session_state.flights, st.session_state.runways); st.rerun()
+                try:
+                    with data_lock:
+                        print("DEBUG: Acquired data_lock for adding flight.")
+                        if 'flights' not in st.session_state:
+                             print("DEBUG: Initializing st.session_state.flights dictionary.")
+                             st.session_state.flights = {}
+                        st.session_state.flights[flight_id] = new_flight_data
+                        print(f"DEBUG: Added {flight_id} to st.session_state.flights.")
+                    print("DEBUG: Released data_lock.")
+
+                    print("DEBUG: Calling save_data...")
+                    save_data(st.session_state.flights, st.session_state.runways)
+                    print("DEBUG: save_data finished.")
+
+                    st.success(f"Flight {flight_id} added.")
+                    print("DEBUG: Calling st.rerun()...")
+                    st.rerun()
+                except Exception as e_add:
+                     print(f"ERROR during flight add/save for {flight_id}: {e_add}")
+                     st.error(f"Error adding flight {flight_id}: {e_add}")
 
     # --- Flight Actions Section ---
     st.header("Flight Actions")
@@ -475,6 +1015,17 @@ with col2: # Controls Column
     with data_lock: runways_copy_infra = copy.deepcopy(st.session_state.runways)
     runways_display = {rid: {'Status': rdata.get('status','?'), 'Flight': rdata.get('flight_id','-'), 'Angle': rdata.get('angle_deg','?')} for rid, rdata in runways_copy_infra.items()}
     st.dataframe(pd.DataFrame.from_dict(runways_display, orient='index'))
+
+    # --- Add Agent Control Button ---
+    st.divider()
+    st.header("ATC Agent Control")
+    # Display status message from session state
+    agent_status = st.session_state.get('agent_status_message', 'Agents Idle.')
+    st.info(agent_status)
+
+    if st.button("Run ATC Agents Cycle", key="run_agents_btn", disabled=st.session_state.get('agent_cycle_running', False)):
+        run_atc_orchestrator(agent_resources) # Pass the cached resources
+        st.rerun()
 
 
 with col1: # Map Column
