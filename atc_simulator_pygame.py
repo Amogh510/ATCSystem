@@ -219,6 +219,57 @@ class ATCSimulatorPygame:
         with self.data_lock: return copy.deepcopy(self.flights)
     def get_all_runway_info(self):
         with self.data_lock: return copy.deepcopy(self.runways)
+    def get_distances_to_runways(self):
+        """Calculates distance from each active flight to each runway threshold."""
+        print("DEBUG TOOL GetDistancesToRunways: Calculating distances...")
+        distances = {}
+        try:
+            with self.data_lock:
+                # Create copies to work with safely
+                flights_copy = copy.deepcopy(self.flights)
+                runways_copy = copy.deepcopy(self.runways)
+
+            active_flights = {
+                fid: data for fid, data in flights_copy.items()
+                if data.get('status') not in [STATUS_ON_GROUND, STATUS_PREPARING_TAKEOFF]
+                   and 'x' in data and 'y' in data
+            }
+
+            if not active_flights:
+                print("DEBUG TOOL GetDistancesToRunways: No active flights.")
+                return {"info": "No active flights to calculate distances for."}
+            if not runways_copy:
+                 print("DEBUG TOOL GetDistancesToRunways: No runways defined.")
+                 return {"info": "No runways defined to calculate distances to."}
+
+
+            for flight_id, flight_data in active_flights.items():
+                flight_x, flight_y = flight_data['x'], flight_data['y']
+                distances[flight_id] = {}
+                for runway_id, runway_data in runways_copy.items():
+                    try:
+                        # Calculate landing threshold point (p1)
+                        threshold_pt, _ = calculate_endpoint(
+                            runway_data['x'], runway_data['y'],
+                            runway_data['length_px'], runway_data['angle_deg']
+                        )
+                        thresh_x, thresh_y = threshold_pt
+                        # Calculate Euclidean distance
+                        dist_px = math.sqrt((thresh_x - flight_x)**2 + (thresh_y - flight_y)**2)
+                        dist_km = dist_px / PIXELS_PER_KM
+                        # Store distance in km for relevance
+                        distances[flight_id][runway_id] = round(dist_km, 1)
+                    except Exception as e_dist:
+                         print(f"ERROR TOOL GetDistances: Failed for {flight_id} to {runway_id}: {e_dist}")
+                         distances[flight_id][runway_id] = "Error"
+
+            print(f"DEBUG TOOL GetDistancesToRunways: Calculated: {distances}")
+            return distances
+
+        except Exception as e_tool:
+            print(f"ERROR TOOL GetDistancesToRunways: General error: {e_tool}")
+            return {"error": f"Internal error in GetDistancesToRunways: {e_tool}"}
+
     def set_waypoints(self, flight_id: str, waypoints: list[tuple[int, int]]):
         print(f"DEBUG TOOL SetWaypoints: Received flight_id='{flight_id}', waypoints={waypoints}") # <<< ADD DEBUG
         try: # <<< ADD TRY
@@ -323,23 +374,21 @@ class ATCSimulatorPygame:
         current_tools = [
             Tool(name="GetAllAircraftInfo", func=lambda _: self.get_all_aircraft_info(), description="Gets current state of all aircraft."),
             Tool(name="GetAllRunwayInfo", func=lambda _: self.get_all_runway_info(), description="Gets current state of all runways."),
-            # --- LAMBDAS USING PARSER ---
+            Tool(name="GetDistancesToRunways",
+                 func=lambda _: self.get_distances_to_runways(),
+                 description="Calculates and returns the distance (in km) from each active flight to the landing threshold of every runway. Useful for prioritizing landings."),
             Tool(name="SetWaypoints",
-                 # Use helper, unpack result, handle potential errors from parser
                  func=lambda tool_input: self.set_waypoints(*self._parse_tool_input(tool_input, 2)),
                  description="Sets waypoints. Input MUST be tuple/list string like '(\"FLT123\", [(100, 200)])' or the actual list/tuple.",
                  handle_tool_error=True), # Let Langchain handle errors raised by _parse_tool_input
             Tool(name="InitiateLanding",
-                 # Use helper, unpack result, handle potential errors from parser
                  func=lambda tool_input: self.initiate_landing(*self._parse_tool_input(tool_input, 2)),
                  description="Directs landing. Input MUST be tuple/list string like '(\"FLT123\", \"RW27L\")' or the actual list/tuple.",
                  handle_tool_error=True), # Let Langchain handle errors raised by _parse_tool_input
             Tool(name="InitiateTakeoff",
-                 # Use helper, unpack result, handle potential errors from parser
                  func=lambda tool_input: self.initiate_takeoff(*self._parse_tool_input(tool_input, 2)),
                  description="Commands takeoff. Input MUST be tuple/list string like '(\"FLT123\", \"RW27L\")' or the actual list/tuple.",
                  handle_tool_error=True), # Let Langchain handle errors raised by _parse_tool_input
-            # --- END LAMBDAS USING PARSER ---
         ]
         print(f"LangChain Tools Defined: {[tool.name for tool in current_tools]}")
         initialized_resources["tools"] = current_tools
@@ -360,17 +409,17 @@ class ATCSimulatorPygame:
     {input}
 
     Thought Process:
-    1. Analyze the current aircraft and runway states provided in the input.
-    2. Identify available runways.
-    3. Identify flights requesting or suitable for landing (Status: En Route, Following Waypoints near the airport - let's assume any non-approaching/departing/ground flight is potentially eligible).
-    4. Identify flights ready for takeoff (Status: On Ground).
-    5. Prioritize landing requests if runways are available. If multiple flights want to land, pick one (e.g., the first one listed for simplicity).
-    6. If no landings are pending/possible but takeoffs are ready and a runway is free, schedule a takeoff.
-    7. If a flight needs to land but no runway is available, consider putting it in a holding pattern by assigning waypoints. A simple holding pattern can be two waypoints forming a small loop near its current position (e.g., current_pos -> point A -> current_pos). Calculate suitable coordinates for point A (e.g., 5km North).
-    8. You can only issue ONE landing or ONE takeoff command per cycle using InitiateLanding or InitiateTakeoff.
-    9. You can issue multiple SetWaypoints commands if needed for holding patterns.
-    10. ONLY use the provided tools. Do not make up information. Provide the required arguments exactly (flight_id as string, runway_id as string, waypoints as list of tuples).
-    11. Respond with your action or state that no action is needed. Use the tools to perform actions.
+    1. Analyze the current aircraft and runway states.
+    2. Use GetDistancesToRunways to understand proximity of flights to landing thresholds.
+    3. Identify available runways.
+    4. Identify flights suitable for landing. Prioritize based on proximity (using GetDistancesToRunways results) or other factors if needed.
+    5. Identify flights ready for takeoff.
+    6. If a suitable landing is possible and a runway is free, issue an InitiateLanding command for the highest priority flight.
+    7. If no landings are priority/possible, but takeoffs are ready and a runway is free, schedule a takeoff using InitiateTakeoff.
+    8. If a flight needs to land but no runway is available, consider using SetWaypoints for a holding pattern (e.g., near its current position).
+    9. You can only issue ONE landing or ONE takeoff command per cycle.
+    10. Use tools precisely as described. Input for tools taking multiple arguments MUST be a tuple or list, or a string representation like '("FLT123", "RW09R")'.
+    11. Respond with your action or state that no action is needed.
 
     Begin!
 
@@ -815,13 +864,13 @@ class ATCSimulatorPygame:
             except Exception as e: print(f"Error drawing flight {flight_id}: {e}")
 
         # 4. Scale and Convert for Pygame Display
-        # Scale the large map image down to fit the window
         scaled_map_img = cv2.resize(map_img, (WINDOW_WIDTH, WINDOW_HEIGHT), interpolation=cv2.INTER_AREA)
-        # Convert BGR (OpenCV) to RGB (Pygame)
         rgb_map_img = cv2.cvtColor(scaled_map_img, cv2.COLOR_BGR2RGB)
-        # Create Pygame surface (use rotate and flip to match coordinate systems if necessary - often needed)
-        pygame_surface = pygame.surfarray.make_surface(np.rot90(rgb_map_img)) # Rotate if needed
-        pygame_surface = pygame.transform.flip(pygame_surface, False, True) # Flip if needed
+
+        # --- Create Pygame surface (Simpler Conversion) ---
+        # Direct conversion - assumes map_img has Y=0 at top, which OpenCV drawing usually does.
+        pygame_surface = pygame.surfarray.make_surface(rgb_map_img)
+        # If orientation is still wrong, try np.rot90(rgb_map_img) inside make_surface
 
         # 5. Blit to Screen
         self.screen.blit(pygame_surface, (0, 0))
@@ -834,6 +883,9 @@ class ATCSimulatorPygame:
     def run(self):
         """Main application loop."""
         running = True
+        # --- Define background color ---
+        BACKGROUND_COLOR = COLOR_WHITE # Or e.g., (220, 220, 220) for light gray
+
         while running:
             # --- Handle Input ---
             for event in pygame.event.get():
@@ -854,7 +906,7 @@ class ATCSimulatorPygame:
                  # agent_thread.start()
 
             # --- Drawing ---
-            self.screen.fill(COLOR_BLACK) # Clear screen
+            self.screen.fill(BACKGROUND_COLOR) # Clear screen with new color
             self.draw()                  # Draw simulation elements
             pygame.display.flip()       # Update the full screen
 
