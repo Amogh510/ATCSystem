@@ -10,12 +10,20 @@ import copy
 import cv2 # Still used for drawing onto the numpy array first
 from dotenv import load_dotenv
 import ast # <<< ADD IMPORT
+import random # <<< ADD IMPORT
 
 # --- LangChain / Groq Imports ---
 from langchain.agents import Tool, initialize_agent, AgentType
 from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 # from langchain.memory import ConversationBufferMemory # Not currently used
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.document_loaders import UnstructuredMarkdownLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain.schema.runnable import RunnablePassthrough, RunnableParallel
+from langchain.schema.output_parser import StrOutputParser
 
 # --- Configuration ---
 DATA_FILE = "atc_state_no_gates_v3.pkl"
@@ -60,6 +68,7 @@ COLOR_RUNWAY_OCCUPIED = (255, 165, 0) # Orange for occupied
 COLOR_WAYPOINT = (0, 180, 0)
 COLOR_WAYPOINT_LINE = (180, 180, 180)
 COLOR_TEXT = (50, 50, 50)
+COLOR_BACKGROUND = COLOR_WHITE # Define background color constant
 
 # --- Helper Functions (Copied) ---
 def calculate_endpoint(x_center, y_center, length_px, angle_deg):
@@ -102,6 +111,7 @@ class ATCSimulatorPygame:
         self.data_lock = threading.Lock() # Still needed if agents run threaded
         self.flights = {}
         self.runways = {}
+        self.flight_counter = 0 # <<< ADD Counter for unique IDs
         self.load_data() # Load initial state
 
         # --- Agent Init ---
@@ -110,6 +120,7 @@ class ATCSimulatorPygame:
         self.agent_cycle_running = False
         self.last_agent_run_time = time.time()
         self.agent_status_message = "Agents Idle."
+        self.last_random_flight_check_time = time.time() # <<< ADD Timer
 
         # --- Simulation Timing ---
         self.last_update_time = time.time()
@@ -358,9 +369,14 @@ class ATCSimulatorPygame:
 
     # --- Agent Initialization (as Method) ---
     def _initialize_agents_and_llm(self):
-        """Initializes the LLM, tools, and agents once."""
-        print("--- Running Agent Initialization ---")
-        initialized_resources = {"llm": None, "tools": [], "scheduler_agent": None, "conflict_agent": None}
+        """Initializes the LLM, RAG components, tools, and agents."""
+        # ACCEPT that this runs every time the script starts for now
+        print("--- Running Full Agent & RAG Initialization ---")
+        initialized_resources = {
+            "llm": None, "tools": [], "scheduler_agent": None,
+            "conflict_agent": None, "retriever": None # Add retriever
+        }
+        # 1. Initialize LLM
         try:
             llm = ChatGroq(temperature=0.1, model_name="llama3-70b-8192")
             print("Groq LLM Initialized.")
@@ -368,9 +384,50 @@ class ATCSimulatorPygame:
         except Exception as e:
             print(f"ERROR: Failed to initialize Groq LLM: {e}")
             self.agent_status_message = f"LLM Init Failed: {e}"
-            return initialized_resources # Return partially initialized
+            return initialized_resources # LLM is critical
 
-        # Define tools using *instance methods* and the parser helper
+        # --- 2. Initialize RAG Pipeline ---
+        sop_file = "SOP.md"
+        if os.path.exists(sop_file):
+            print(f"Loading SOP document: {sop_file}")
+            try:
+                # Load MARKDOWN instead of PDF
+                loader = UnstructuredMarkdownLoader(sop_file)
+                docs = loader.load()
+
+                # Split Text
+                text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+                splits = text_splitter.split_documents(docs)
+                print(f"SOP split into {len(splits)} chunks.")
+
+                # Create Embeddings (Downloads model on first run)
+                print("Initializing embedding model...")
+                # Using a common, relatively small sentence transformer
+                model_name = "sentence-transformers/all-MiniLM-L6-v2"
+                hf_embeddings = HuggingFaceEmbeddings(model_name=model_name)
+                print("Embedding model loaded.")
+
+                # Create FAISS Vector Store (In-Memory)
+                print("Creating FAISS vector store from SOP chunks...")
+                vectorstore = FAISS.from_documents(splits, hf_embeddings)
+                print("FAISS vector store created.")
+
+                # Create Retriever
+                retriever = vectorstore.as_retriever()
+                initialized_resources["retriever"] = retriever
+                print("SOP Retriever Initialized.")
+
+            except Exception as e_rag:
+                print(f"ERROR during RAG pipeline setup: {e_rag}")
+                self.agent_status_message = f"RAG Init Failed: {e_rag}"
+                # Continue without retriever if RAG fails? Or fail completely?
+                # Let's continue without it for now, comms will fallback.
+        else:
+            print(f"WARNING: {sop_file} not found. Communication agent will not use RAG.")
+            self.agent_status_message = "SOP.md not found; using basic comms."
+
+
+        # --- 3. Define Tools ---
         current_tools = [
             Tool(name="GetAllAircraftInfo", func=lambda _: self.get_all_aircraft_info(), description="Gets current state of all aircraft."),
             Tool(name="GetAllRunwayInfo", func=lambda _: self.get_all_runway_info(), description="Gets current state of all runways."),
@@ -380,26 +437,26 @@ class ATCSimulatorPygame:
             Tool(name="SetWaypoints",
                  func=lambda tool_input: self.set_waypoints(*self._parse_tool_input(tool_input, 2)),
                  description="Sets waypoints. Input MUST be tuple/list string like '(\"FLT123\", [(100, 200)])' or the actual list/tuple.",
-                 handle_tool_error=True), # Let Langchain handle errors raised by _parse_tool_input
+                 handle_tool_error=True),
             Tool(name="InitiateLanding",
                  func=lambda tool_input: self.initiate_landing(*self._parse_tool_input(tool_input, 2)),
                  description="Directs landing. Input MUST be tuple/list string like '(\"FLT123\", \"RW27L\")' or the actual list/tuple.",
-                 handle_tool_error=True), # Let Langchain handle errors raised by _parse_tool_input
+                 handle_tool_error=True),
             Tool(name="InitiateTakeoff",
                  func=lambda tool_input: self.initiate_takeoff(*self._parse_tool_input(tool_input, 2)),
                  description="Commands takeoff. Input MUST be tuple/list string like '(\"FLT123\", \"RW27L\")' or the actual list/tuple.",
-                 handle_tool_error=True), # Let Langchain handle errors raised by _parse_tool_input
+                 handle_tool_error=True),
         ]
         print(f"LangChain Tools Defined: {[tool.name for tool in current_tools]}")
         initialized_resources["tools"] = current_tools
 
-        # Initialize Agents (Add full prompts back)
-        llm = initialized_resources.get("llm") # Get LLM from dict
-        if not llm: # Check if LLM initialized
+        # --- 4. Initialize Agents ---
+        llm = initialized_resources.get("llm")
+        if not llm:
              print("ERROR: LLM not available for agent initialization.")
-             return initialized_resources # Return without agents if LLM failed
+             return initialized_resources
 
-        # -- Scheduler Agent --
+        # -- Scheduler Agent (Using full prompt with distance tool mention) --
         scheduler_prompt_template = """You are an expert Air Traffic Control Scheduler. Your goal is to manage landings and takeoffs efficiently and safely using the available runways.
 
     Available Tools:
@@ -436,7 +493,7 @@ class ATCSimulatorPygame:
             initialized_resources["scheduler_agent"] = scheduler_agent
         except Exception as e: print(f"Error initializing Scheduler Agent: {e}")
 
-        # -- Conflict Resolution Agent --
+        # -- Conflict Resolution Agent (Using full prompt) --
         conflict_prompt_template = """You are an expert Air Traffic Control Conflict Resolution specialist. Your goal is to prevent aircraft from getting too close to each other (loss of separation). Assume minimum safe separation is 150 pixels horizontally OR 1000 feet vertically.
 
     Available Tools:
@@ -452,7 +509,7 @@ class ATCSimulatorPygame:
     4. If a potential conflict is detected between Flight A and Flight B:
         a. Identify the flights involved (flight_id).
         b. Note their current positions, altitudes, and statuses.
-        c. Decide on a resolution strategy. The simplest is to vector (turn) one of the aircraft slightly using SetWaypoints. Choose the aircraft that is NOT currently landing or taking off, if possible.
+        c. Decide on a resolution strategy. The simplest is to vector (turn) one of the aircraft slightly using SetWaypoints. **IMPORTANT: Check the status of both aircraft. If one aircraft has status 'Approaching', DO NOT change its waypoints. Instead, vector the *other* aircraft involved in the conflict.** If both are approaching (unlikely but possible), you may need to state you cannot resolve safely with a simple vector. Choose the aircraft that is NOT currently landing or taking off, if possible.
         d. Calculate a safe vector: Assign a single waypoint slightly off the current aircraft's track (e.g., 5km ahead and 30 degrees to the right of its current heading). Calculate the (x, y) coordinates for this waypoint.
         e. Use the SetWaypoints tool to issue the vector to the chosen aircraft. Provide flight_id and the calculated waypoint as a list containing one tuple: `[(x, y)]`.
     5. Handle only ONE conflict per cycle. If multiple conflicts exist, resolve the most critical (closest pair) first and stop.
@@ -474,7 +531,8 @@ class ATCSimulatorPygame:
             initialized_resources["conflict_agent"] = conflict_agent
         except Exception as e: print(f"Error initializing Conflict Agent: {e}")
 
-        print("--- Agent Initialization Complete ---")
+
+        print("--- Full Initialization Complete ---")
         return initialized_resources
 
     # --- Simulation Update Logic (threaded) ---
@@ -690,44 +748,53 @@ class ATCSimulatorPygame:
             # Short sleep to prevent CPU hogging if updates are very fast
             time.sleep(0.01) # Sleep even if no updates happened
 
-    # --- Agent Orchestration (as Method) ---
-    # Simplified: Runs synchronously in main loop for now
-    def run_agent_cycle(self):
-        """Runs the agent decision-making cycle."""
+    # --- Agent Orchestration (THREAD TARGET) ---
+    def _agent_cycle_thread_target(self):
+        """Target function for the background agent execution thread."""
+        # This function contains the logic previously in run_agent_cycle
+        print("\n--- Background Agent Cycle Started ---")
+        # Get resources safely within the thread
         llm = self.agent_resources.get("llm")
         scheduler_agent = self.agent_resources.get("scheduler_agent")
         conflict_agent = self.agent_resources.get("conflict_agent")
+        retriever = self.agent_resources.get("retriever")
 
         if not llm or not scheduler_agent or not conflict_agent:
-            self.agent_status_message = "ERROR: Agents not initialized."
-            print("AgentCycle: ERROR - Required agent resources not initialized.")
+            comm_message = "ERROR: Agents not initialized."
+            print("AgentThread: ERROR - Required agent resources not initialized.")
+            with self.data_lock: # Use lock to update shared state
+                 self.agent_status_message = comm_message
+                 self.agent_cycle_running = False # Mark as finished (due to error)
             return
 
-        print("\n--- Running Agent Cycle ---")
-        self.agent_status_message = "Agents running..."
         action_details = {}
         action_taken_this_cycle = False
+        comm_message = "Agents running..." # Initial status for thread
 
         try:
             # 1. Get State
             current_aircraft_info = self.get_all_aircraft_info()
             current_runway_info = self.get_all_runway_info()
             if not current_aircraft_info:
-                self.agent_status_message = "No aircraft; agents idle."
-                print("AgentCycle: No aircraft detected.")
-                return
+                 comm_message = "No aircraft; agents idle."
+                 print("AgentThread: No aircraft detected, exiting.")
+                 # Need to update status and running flag before returning
+                 with self.data_lock:
+                     self.agent_status_message = comm_message
+                     self.agent_cycle_running = False
+                 return
 
             current_state_summary = f"Time: {time.time():.0f}\nAircraft: {current_aircraft_info}\nRunways: {current_runway_info}"
-            print(f"AgentCycle: State Snapshot:\n{current_state_summary}")
+            print(f"AgentThread: State Snapshot:\n{current_state_summary}")
 
             # 2. Run Scheduler
-            print("AgentCycle: Running SCHEDULER...")
+            print("AgentThread: Running SCHEDULER...")
             scheduler_input_dict = {"input": current_state_summary}
             try:
                 scheduler_response = scheduler_agent.invoke(scheduler_input_dict)
                 scheduler_output = scheduler_response.get('output', '')
                 print(f"Scheduler Raw Output: {scheduler_output}")
-                # --- Parsing (same basic logic as before) ---
+                # --- Parsing logic (same as before) ---
                 if "InitiateLanding successfully" in scheduler_output or "Successfully directed" in scheduler_output:
                     parts = scheduler_output.split()
                     try: flight_id=parts[parts.index("landing")-1]; runway_id=parts[parts.index("on")+1].replace('.',''); action_details[flight_id]=f"cleared approach {runway_id}"; action_taken_this_cycle=True
@@ -743,7 +810,7 @@ class ATCSimulatorPygame:
             except Exception as e: print(f"ERROR running Scheduler: {e}")
 
             # 3. Run Conflict Resolver
-            print("\nAgentCycle: Running CONFLICT RESOLVER...")
+            print("\nAgentThread: Running CONFLICT RESOLVER...")
             current_aircraft_info = self.get_all_aircraft_info() # Re-get state
             current_runway_info = self.get_all_runway_info()
             active_flights_count = sum(1 for d in current_aircraft_info.values() if d.get('status') not in [STATUS_ON_GROUND, STATUS_PREPARING_TAKEOFF])
@@ -762,47 +829,86 @@ class ATCSimulatorPygame:
                              if flight_id not in action_details: action_details[flight_id]="vector for traffic"; action_taken_this_cycle=True
                         except:
                             if "Conflict" not in action_details: action_details["Conflict"]="Vector (parse fail)"; action_taken_this_cycle=True
-                    elif "No conflicts detected" in conflict_output: print("AgentCycle: No conflicts reported.")
+                    elif "No conflicts detected" in conflict_output: print("AgentThread: No conflicts reported.")
                 except Exception as e: print(f"ERROR running Conflict Resolver: {e}")
-            else: print("AgentCycle: Skipping conflict check.")
+            else: print("AgentThread: Skipping conflict check.")
 
-            # 4. Generate Communication
+            # --- 4. Generate Communication (using RAG if available) ---
             if action_details:
-                print("\nAgentCycle: Generating Communication...")
-                comm_prompt = "Generate ATC radio calls for:\n" + "\n".join([f"- {f}: {d}" for f,d in action_details.items()])
-                try:
-                    comm_resp = llm.invoke(comm_prompt)
-                    self.agent_status_message = "Comms:\n" + getattr(comm_resp, 'content', str(comm_resp))
-                except Exception as e:
-                    print(f"ERROR running Comm Gen: {e}")
-                    self.agent_status_message = "Comm Gen Failed."
-            else:
-                self.agent_status_message = "Agents finished: No actions taken."
+                # ... (Generate comms logic using RAG/fallback as before) ...
+                # Store result in local comm_message variable
+                print("\nAgentThread: Generating Communication...")
+                question = "Generate concise, realistic ATC radio calls based on standard phraseology for the following actions:\n"
+                question += "\n".join([f"- {f}: {d}" for f, d in action_details.items()])
 
-            # 5. Save State (Optional: or save less frequently)
+                if retriever: # Use RAG pipeline
+                    # ... (RAG chain setup and invoke) ...
+                    template = """Answer the question based only on the following context, simulating standard ATC phraseology. If the context isn't relevant, generate a standard concise radio call.
+
+                    Context:
+                    {context}
+
+                    Question:
+                    {question}
+
+                    Answer:"""
+                    prompt = ChatPromptTemplate.from_template(template)
+                    rag_chain = (
+                        RunnableParallel(
+                           {"context": retriever, "question": RunnablePassthrough()}
+                        )
+                        | prompt
+                        | llm
+                        | StrOutputParser()
+                    )
+                    try:
+                        final_comm = rag_chain.invoke(question)
+                        print(f"RAG Comms Raw Output: {final_comm}")
+                        comm_message = "RAG Comms:\n" + final_comm
+                    except Exception as e_rag_invoke:
+                         print(f"ERROR invoking RAG chain: {e_rag_invoke}")
+                         comm_message = "RAG Comm Failed."
+                         try:
+                             comm_resp = llm.invoke(question + "\n\nAnswer:")
+                             comm_message = "Comms (RAG fallback):\n" + getattr(comm_resp, 'content', str(comm_resp))
+                         except Exception as e_llm_fb: print(f"ERROR basic LLM fallback: {e_llm_fb}")
+                else: # Fallback to basic LLM call
+                    print("AgentThread: Using basic LLM for communication.")
+                    try:
+                        comm_resp = llm.invoke(question + "\n\nAnswer:")
+                        comm_message = "Comms (Basic):\n" + getattr(comm_resp, 'content', str(comm_resp))
+                    except Exception as e_llm_basic: print(f"ERROR basic LLM: {e_llm_basic}"); comm_message = "Basic Comm Failed."
+            else:
+                comm_message = "Agents finished: No actions taken."
+
+            # --- 5. Save State --- 
             if action_taken_this_cycle:
-                print("\nAgentCycle: Saving state...")
-                self.save_data()
+                print("\nAgentThread: Saving state...")
+                self.save_data() # save_data uses its own lock
 
         except Exception as e_cycle:
-            print(f"ERROR in agent cycle: {e_cycle}")
-            self.agent_status_message = f"Agent Cycle Failed: {e_cycle}"
+            print(f"ERROR in background agent cycle: {e_cycle}")
+            comm_message = f"Agent Cycle Failed: {e_cycle}"
 
-        print("--- Agent Cycle Finished ---")
-        self.last_agent_run_time = time.time() # Reset timer
+        # --- Update shared state AFTER cycle completes or fails --- 
+        with self.data_lock:
+             self.agent_status_message = comm_message
+             self.agent_cycle_running = False # Reset the flag
+
+        print("--- Background Agent Cycle Finished ---")
 
     # --- Drawing ---
     def draw(self):
         """Draws the simulation state onto the screen."""
-        # 1. Create Base Map Image (on black background)
-        map_img = np.zeros((MAP_HEIGHT_PX, MAP_WIDTH_PX, 3), dtype=np.uint8)
+        # 1. Create Base Map Image with Background Color (Full Size)
+        map_img = np.full((MAP_HEIGHT_PX, MAP_WIDTH_PX, 3), COLOR_BACKGROUND, dtype=np.uint8)
 
-        # Get safe copies of state for drawing
+        # 2. Get safe copies of state for drawing
         with self.data_lock:
             runways_draw_copy = copy.deepcopy(self.runways)
             flights_draw_copy = copy.deepcopy(self.flights)
 
-        # 2. Draw Runways
+        # 3. Draw Runways onto the large map_img
         for rwy_id, data in runways_draw_copy.items():
             try:
                 x_c, y_c = int(data['x']), int(data['y']); angle = data['angle_deg']
@@ -814,7 +920,7 @@ class ATCSimulatorPygame:
                 cv2.putText(map_img, rwy_id, (x_c + 10, y_c - w_px), cv2.FONT_HERSHEY_SIMPLEX, 0.9, COLOR_WHITE, 2)
             except Exception as e: print(f"Error drawing runway {rwy_id}: {e}")
 
-        # 3. Draw Flights and Waypoints
+        # 4. Draw Flights and Waypoints onto the large map_img
         ARROW_LENGTH = 30
         for flight_id, data in flights_draw_copy.items():
             status = data.get('status', 'Unknown')
@@ -863,30 +969,43 @@ class ATCSimulatorPygame:
                     cv2.putText(map_img, label, (fx + 10, fy - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.7, COLOR_TEXT, 2)
             except Exception as e: print(f"Error drawing flight {flight_id}: {e}")
 
-        # 4. Scale and Convert for Pygame Display
-        scaled_map_img = cv2.resize(map_img, (WINDOW_WIDTH, WINDOW_HEIGHT), interpolation=cv2.INTER_AREA)
-        rgb_map_img = cv2.cvtColor(scaled_map_img, cv2.COLOR_BGR2RGB)
+        # --- 5. Scale the ENTIRE map down to window size ---
+        try:
+            scaled_map_img = cv2.resize(map_img, (WINDOW_WIDTH, WINDOW_HEIGHT), interpolation=cv2.INTER_AREA)
+        except Exception as e_resize:
+            # ...(handle resize error)
+            return
 
-        # --- Create Pygame surface (Simpler Conversion) ---
-        # Direct conversion - assumes map_img has Y=0 at top, which OpenCV drawing usually does.
-        pygame_surface = pygame.surfarray.make_surface(rgb_map_img)
-        # If orientation is still wrong, try np.rot90(rgb_map_img) inside make_surface
+        # 6. Convert SCALED image for Pygame Display
+        rgb_scaled_np = cv2.cvtColor(scaled_map_img, cv2.COLOR_BGR2RGB)
 
-        # 5. Blit to Screen
+        # 7. Transpose axes for Pygame (width, height)
+        transposed_rgb_scaled = np.transpose(rgb_scaled_np, (1, 0, 2))
+
+        # 8. Create Pygame surface from the TRANSPOSED, SCALED array
+        try:
+             pygame_surface = pygame.surfarray.make_surface(transposed_rgb_scaled)
+             # Keep orientation fix if needed (depends on exact libraries/versions)
+             # pygame_surface = pygame.transform.flip(pygame_surface, False, True) # Add back if needed
+        except Exception as e_surf:
+            print(f"ERROR creating Pygame surface: {e_surf}")
+             # ...(handle surface error)
+
+        # 9. Blit the final surface to Screen at (0,0)
         self.screen.blit(pygame_surface, (0, 0))
 
-        # 6. Draw Agent Status Text - Use anti-aliasing (True)
-        status_text = self.font.render(self.agent_status_message, True, COLOR_WHITE, COLOR_BLACK) # White text on black bg
-        self.screen.blit(status_text, (10, 10)) # Position at top-left
+        # 10. Draw Agent Status Text (on top)
+        status_surface = self.font.render(self.agent_status_message, True, COLOR_BLACK, COLOR_BACKGROUND)
+        self.screen.blit(status_surface, (10, 10))
 
     # --- Main Loop ---
     def run(self):
         """Main application loop."""
         running = True
-        # --- Define background color ---
-        BACKGROUND_COLOR = COLOR_WHITE # Or e.g., (220, 220, 220) for light gray
+        BACKGROUND_COLOR = COLOR_BACKGROUND
 
         while running:
+            current_loop_time = time.time()
             # --- Handle Input ---
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
@@ -895,23 +1014,36 @@ class ATCSimulatorPygame:
                     self.simulation_running = False # Signal sim thread to stop
                 # Add keyboard handling here later if needed (e.g., run agents manually)
 
-            # --- Agent Cycle Check ---
-            if not self.agent_cycle_running and (time.time() - self.last_agent_run_time > AGENT_CYCLE_INTERVAL_SECONDS):
-                 # Consider running agents in a thread to avoid blocking render loop
-                 # For simplicity now, run synchronously:
-                 self.run_agent_cycle()
-                 # If using thread:
-                 # self.agent_cycle_running = True
-                 # agent_thread = threading.Thread(target=self._agent_cycle_thread_target, args=(self.agent_resources,), daemon=True)
-                 # agent_thread.start()
+            # --- Random Flight Check (approx every minute) ---
+            if current_loop_time - self.last_random_flight_check_time > 60.0:
+                print("Checking for random flight addition...")
+                if random.randint(1, 1000) == 1:
+                    self._add_random_flight()
+                self.last_random_flight_check_time = current_loop_time # Reset timer
+
+            # --- Agent Cycle Check --- 
+            # Use the flag self.agent_cycle_running read safely
+            with self.data_lock:
+                 is_agent_running = self.agent_cycle_running
+
+            if not is_agent_running and (current_loop_time - self.last_agent_run_time > AGENT_CYCLE_INTERVAL_SECONDS):
+                 print("MainLoop: Triggering agent cycle in background thread...")
+                 with self.data_lock: # Safely set the running flag
+                      self.agent_cycle_running = True
+                      self.agent_status_message = "Agents starting..." # Update status immediately
+
+                 # --- Start agent cycle in a background thread --- 
+                 agent_thread = threading.Thread(target=self._agent_cycle_thread_target, daemon=True)
+                 agent_thread.start()
+                 self.last_agent_run_time = current_loop_time # Reset timer now
 
             # --- Drawing ---
-            self.screen.fill(BACKGROUND_COLOR) # Clear screen with new color
-            self.draw()                  # Draw simulation elements
-            pygame.display.flip()       # Update the full screen
+            # self.screen.fill(BACKGROUND_COLOR) # REMOVED - Background is part of draw() now
+            self.draw() # Draw handles its own background now
+            pygame.display.flip()
 
             # --- Timing ---
-            self.clock.tick(FPS)         # Maintain frame rate
+            self.clock.tick(FPS)
 
         # --- Cleanup ---
         if self.sim_update_thread.is_alive():
@@ -919,9 +1051,76 @@ class ATCSimulatorPygame:
         pygame.quit()
         print("Application Exited.")
 
+    def _add_random_flight(self):
+        """Creates and adds a new flight with random parameters."""
+        self.flight_counter += 1
+        flight_id = f"RAND{self.flight_counter:03d}"
+        print(f"Attempting to add random flight: {flight_id}")
+
+        # Determine entry edge and initial parameters
+        edge = random.choice(["top", "bottom", "left", "right"])
+        altitude = random.randint(250, 350) * 100.0 # 25k-35k ft
+        speed = DEFAULT_FLIGHT_SPEED_KNOTS
+        status = STATUS_EN_ROUTE
+        x, y, direction = 0.0, 0.0, 0.0
+
+        margin = 50 # Start slightly inside the map
+        map_center_x = MAP_WIDTH_PX / 2
+        map_center_y = MAP_HEIGHT_PX / 2
+
+        if edge == "top":
+            x = random.uniform(margin, MAP_WIDTH_PX - margin)
+            y = float(margin)
+            # Aim towards general center area south of start
+            target_y = random.uniform(map_center_y, MAP_HEIGHT_PX * 0.75)
+            angle_rad = math.atan2(-(target_y - y), map_center_x - x)
+            direction = (90 - math.degrees(angle_rad) + 360) % 360
+        elif edge == "bottom":
+            x = random.uniform(margin, MAP_WIDTH_PX - margin)
+            y = float(MAP_HEIGHT_PX - margin)
+            target_y = random.uniform(MAP_HEIGHT_PX * 0.25, map_center_y)
+            angle_rad = math.atan2(-(target_y - y), map_center_x - x)
+            direction = (90 - math.degrees(angle_rad) + 360) % 360
+        elif edge == "left":
+            x = float(margin)
+            y = random.uniform(margin, MAP_HEIGHT_PX - margin)
+            target_x = random.uniform(map_center_x, MAP_WIDTH_PX * 0.75)
+            angle_rad = math.atan2(-(map_center_y - y), target_x - x)
+            direction = (90 - math.degrees(angle_rad) + 360) % 360
+        elif edge == "right":
+            x = float(MAP_WIDTH_PX - margin)
+            y = random.uniform(margin, MAP_HEIGHT_PX - margin)
+            target_x = random.uniform(MAP_WIDTH_PX * 0.25, map_center_x)
+            angle_rad = math.atan2(-(map_center_y - y), target_x - x)
+            direction = (90 - math.degrees(angle_rad) + 360) % 360
+
+        new_flight_data = {
+            'speed': speed,
+            'direction': direction,
+            'x': x,
+            'y': y,
+            'altitude': altitude,
+            'status': status,
+            'waypoints': [],
+            'current_waypoint_index': -1,
+            'target_runway': None,
+            'takeoff_clearance_time': None
+        }
+
+        try:
+            with self.data_lock:
+                if flight_id not in self.flights:
+                    self.flights[flight_id] = new_flight_data
+                    print(f"Successfully added random flight {flight_id} at ({int(x)}, {int(y)}), heading {int(direction)}deg")
+                else:
+                    print(f"WARN: Random flight ID {flight_id} already existed? Skipping.")
+        except Exception as e:
+            print(f"ERROR: Failed to add random flight {flight_id}: {e}")
+
 # --- Main Execution ---
 if __name__ == "__main__":
-    # Ensure you have pygame installed: pip install pygame
-    # Ensure prompts in _initialize_agents_and_llm are the full detailed ones
+    # Ensure dependencies are installed:
+    # pip install pygame python-dotenv langchain langchain-groq langchain-community pypdf faiss-cpu sentence-transformers tiktoken unstructured
+    # Ensure SOP.md exists in the same directory
     simulator = ATCSimulatorPygame()
     simulator.run()
