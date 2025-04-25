@@ -373,11 +373,10 @@ def initialize_agents_and_llm():
     4. Identify flights ready for takeoff (Status: On Ground).
     5. Prioritize landing requests if runways are available. If multiple flights want to land, pick one (e.g., the first one listed for simplicity).
     6. If no landings are pending/possible but takeoffs are ready and a runway is free, schedule a takeoff.
-    7. If a flight needs to land but no runway is available, consider putting it in a holding pattern by assigning waypoints. A simple holding pattern can be two waypoints forming a small loop near its current position (e.g., current_pos -> point A -> current_pos). Calculate suitable coordinates for point A (e.g., 5km North).
+    7. If a flight needs to land but no runway is available, consider putting it in a holding pattern by assigning waypoints. A simple holding pattern can be 3 waypoints forming a small loop near its current position (e.g., current_pos -> point A -> point B -> current_pos). Calculate suitable coordinates for point A and point B (e.g., 5km North and 5km East of current_pos).
     8. You can only issue ONE landing or ONE takeoff command per cycle using InitiateLanding or InitiateTakeoff.
-    9. You can issue multiple SetWaypoints commands if needed for holding patterns.
-    10. ONLY use the provided tools. Do not make up information. Provide the required arguments exactly (flight_id as string, runway_id as string, waypoints as list of tuples).
-    11. Respond with your action or state that no action is needed. Use the tools to perform actions.
+    9. ONLY use the provided tools. Do not make up information. Provide the required arguments exactly (flight_id as string, runway_id as string, waypoints as list of tuples).
+    10. Respond with your action or state that no action is needed. Use the tools to perform actions.
 
     Begin!
 

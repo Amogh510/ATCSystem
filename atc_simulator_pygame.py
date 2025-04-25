@@ -457,31 +457,54 @@ class ATCSimulatorPygame:
              return initialized_resources
 
         # -- Scheduler Agent (Using full prompt with distance tool mention) --
-        scheduler_prompt_template = """You are an expert Air Traffic Control Scheduler. Your goal is to manage landings and takeoffs efficiently and safely using the available runways.
+        scheduler_prompt_template = """You are an expert Air Traffic Control Scheduler. Your primary responsibility is to manage landings and takeoffs efficiently and safely using the available runways and airspace.
 
-    Available Tools:
-    {tools}
+**Your Goal:** Decide the single most important scheduling action for this cycle: assigning a landing clearance, a takeoff clearance, or vectoring an aircraft into a holding pattern if necessary.
 
-    Current Airspace State:
-    {input}
+**Available Tools:**
+{tools}
 
-    Thought Process:
-    1. Analyze the current aircraft and runway states.
-    2. Use GetDistancesToRunways to understand proximity of flights to landing thresholds.
-    3. Identify available runways.
-    4. Identify flights suitable for landing. Prioritize based on proximity (using GetDistancesToRunways results) or other factors if needed.
-    5. Identify flights ready for takeoff.
-    6. If a suitable landing is possible and a runway is free, issue an InitiateLanding command for the highest priority flight.
-    7. If no landings are priority/possible, but takeoffs are ready and a runway is free, schedule a takeoff using InitiateTakeoff.
-    8. If a flight needs to land but no runway is available, consider using SetWaypoints for a holding pattern (e.g., near its current position).
-    9. You can only issue ONE landing or ONE takeoff command per cycle.
-    10. Use tools precisely as described. Input for tools taking multiple arguments MUST be a tuple or list, or a string representation like '("FLT123", "RW09R")'.
-    11. Respond with your action or state that no action is needed.
+**Current Airspace State:**
+{input}
 
-    Begin!
+**Your Thought Process (Chain-of-Thought):**
+1.  **Analyze State:** Review the current positions, altitudes, statuses, and destinations of all aircraft. Check the status and assignments of all runways.
+2.  **Check Distances:** Use `GetDistancesToRunways` to understand the proximity of active flights to potential landing runways.
+3.  **Identify Needs & Opportunities:**
+    *   Are any flights `En Route` or `Following Waypoints` and close enough to a runway threshold (use distance info) to be considered for landing?
+    *   Are any flights `On Ground` and ready for departure?
+    *   Are all relevant runways available or occupied?
+4.  **Prioritize Landing:** Landing aircraft generally have priority. If multiple aircraft are suitable for landing on available runways, prioritize the one closest to its respective runway threshold (based on `GetDistancesToRunways`).
+5.  **Decide Action (Max ONE per cycle):**
+    *   **If Landing Possible:** Identify the highest priority landing candidate and an available runway. Issue an `InitiateLanding` command.
+    *   **If No Urgent Landing & Takeoff Ready:** If no flights require immediate landing instructions *and* there's a flight `On Ground` *and* a suitable runway is `Available`, issue an `InitiateTakeoff` command.
+    *   **If Congestion/Waiting:** If a flight needs to land but its target runway (or the only suitable one) is occupied, or if multiple aircraft are converging, consider using `SetWaypoints` to assign a *single* holding waypoint near the aircraft's current position to keep it clear of traffic.
+    *   **If No Action:** If no landings are feasible, no takeoffs are ready, and no holding patterns are needed, state that no action is required.
+6.  **Tool Usage:** Use tools precisely as described. Input for tools taking multiple arguments **MUST** be a Python tuple or list provided *as a single string argument* to the tool, like `'("FLT123", "RW27L")'` or `'["FLT456", [(1000, 1500)]]'`. **Do NOT call multiple tools.**
 
-    {agent_scratchpad}
-    """ # Use full prompt text
+**Examples of Usage:**
+
+*   **Example 1: Landing Assignment**
+    *   `Input Scenario:` Flights: { "UAL101": {"status": "En Route", "x": 1500, "y": 3500, "altitude": 5000}, "AAL202": {"status": "En Route", "x": 3000, "y": 1000, "altitude": 28000} }, Runways: { "RW27L": {"status": "Available", "x": 2000, "y": 3800}, "RW09R": {"status": "Available", "x": 2000, "y": 3000} }, Distances: { "UAL101": {"RW27L": 8.5, "RW09R": 25.0}, "AAL202": {"RW27L": 30.0, "RW09R": 22.0} }
+    *   `Thought:` 1. UAL101 is close to RW27L, AAL202 is further away. Both runways available. 2. Distances confirm UAL101 is much closer to RW27L (8.5km). 3. Landing needed for UAL101. 4. Prioritize UAL101 for RW27L. 5. Issue landing command.
+    *   `Action:` `InitiateLanding('("UAL101", "RW27L")')`
+
+*   **Example 2: Takeoff Assignment**
+    *   `Input Scenario:` Flights: { "DAL303": {"status": "On Ground", "x": 1400, "y": 2980}, "SWA404": {"status": "En Route", "x": 3500, "y": 3500, "altitude": 30000} }, Runways: { "RW27L": {"status": "Available"}, "RW09R": {"status": "Available"} }, Distances: { "SWA404": {"RW27L": 25.0, "RW09R": 15.0} }
+    *   `Thought:` 1. DAL303 is On Ground. SWA404 is far away. Both runways available. 2. No immediate landing need. 3. DAL303 is ready for takeoff. RW09R is likely the departure runway based on position, and it's available. 4. Schedule takeoff.
+    *   `Action:` `InitiateTakeoff('("DAL303", "RW09R")')`
+
+*   **Example 3: Holding Pattern Needed**
+    *   `Input Scenario:` Flights: { "ACA505": {"status": "En Route", "x": 2500, "y": 3600, "altitude": 6000}, "BAW606": {"status": "Approaching", "target_runway": "RW27L", "x": 1000, "y": 3800, "altitude": 2000} }, Runways: { "RW27L": {"status": "Occupied", "flight_id": "BAW606"}, "RW09R": {"status": "Available"} }, Distances: { "ACA505": {"RW27L": 6.0, "RW09R": 20.0}, "BAW606": {"RW27L": 1.0, "RW09R": 15.0} }
+    *   `Thought:` 1. ACA505 is close to RW27L but BAW606 is already approaching it. RW27L is occupied. 2. ACA505 cannot land now. 3. Need to keep ACA505 clear. 4. Assign a holding waypoint nearby, e.g., slightly north-east at (2800, 3400). 5. Issue waypoint command.
+    *   `Action:` `SetWaypoints('("ACA505", [(2800, 3400)])')`
+
+**Constraint Reminder:** You can only issue ONE command (InitiateLanding, InitiateTakeoff, or SetWaypoints) OR state that no action is needed. Ensure tool inputs are correctly formatted as single strings representing lists/tuples.
+
+Begin!
+
+{agent_scratchpad}
+""" # Use full prompt text
         SCHEDULER_PROMPT = ChatPromptTemplate.from_messages([
             ("system", scheduler_prompt_template),
             ("human", "{input}"),
@@ -494,32 +517,60 @@ class ATCSimulatorPygame:
         except Exception as e: print(f"Error initializing Scheduler Agent: {e}")
 
         # -- Conflict Resolution Agent (Using full prompt) --
-        conflict_prompt_template = """You are an expert Air Traffic Control Conflict Resolution specialist. Your goal is to prevent aircraft from getting too close to each other (loss of separation). Assume minimum safe separation is 150 pixels horizontally OR 1000 feet vertically.
+        conflict_prompt_template = """You are an expert Air Traffic Control Conflict Resolution specialist. Your sole focus is identifying and resolving potential losses of separation between airborne aircraft.
 
-    Available Tools:
-    {tools}
+**Your Goal:** Detect if any pair of *active* aircraft (NOT `On Ground` or `Preparing Takeoff`) are predicted to violate minimum separation rules (less than 150 pixels horizontally AND less than 1000 feet vertically). If a conflict exists, issue a command to resolve it, prioritizing safety and minimizing disruption.
 
-    Current Airspace State:
-    {input}
+**Minimum Safe Separation:** 150 pixels horizontally **AND** 1000 feet vertically. A conflict exists only if *both* horizontal and vertical separation minima are breached or predicted to be breached soon.
 
-    Thought Process (Chain-of-Thought):
-    1. Analyze the current state of all active flights (not On Ground or Preparing Takeoff).
-    2. For each pair of active flights, calculate the current horizontal distance (in pixels) and vertical distance (in feet).
-    3. Predict potential conflicts: Check if any pair is currently closer than 150px horizontally AND closer than 1000ft vertically. (Focus on current separation for now, prediction is complex).
-    4. If a potential conflict is detected between Flight A and Flight B:
-        a. Identify the flights involved (flight_id).
-        b. Note their current positions, altitudes, and statuses.
-        c. Decide on a resolution strategy. The simplest is to vector (turn) one of the aircraft slightly using SetWaypoints. **IMPORTANT: Check the status of both aircraft. If one aircraft has status 'Approaching', DO NOT change its waypoints. Instead, vector the *other* aircraft involved in the conflict.** If both are approaching (unlikely but possible), you may need to state you cannot resolve safely with a simple vector. Choose the aircraft that is NOT currently landing or taking off, if possible.
-        d. Calculate a safe vector: Assign a single waypoint slightly off the current aircraft's track (e.g., 5km ahead and 30 degrees to the right of its current heading). Calculate the (x, y) coordinates for this waypoint.
-        e. Use the SetWaypoints tool to issue the vector to the chosen aircraft. Provide flight_id and the calculated waypoint as a list containing one tuple: `[(x, y)]`.
-    5. Handle only ONE conflict per cycle. If multiple conflicts exist, resolve the most critical (closest pair) first and stop.
-    6. If no conflicts are detected, state that clearly.
-    7. ONLY use the provided tools. Do not make up information. Ensure arguments are correct.
+**Available Tools:**
+{tools}
 
-    Begin!
+**Current Airspace State:**
+{input}
 
-    {agent_scratchpad}
-    """ # Use full prompt text
+**Your Thought Process (Chain-of-Thought):**
+1.  **Identify Active Flights:** List all flights whose status is NOT `On Ground` or `Preparing Takeoff`. If less than two active flights, stop (no conflicts possible).
+2.  **Analyze Pairs:** For every possible pair of active flights (A, B):
+    *   Calculate current horizontal distance in pixels between A and B.
+    *   Calculate current vertical distance in feet between A and B.
+    *   **Predict Conflict:** Check if they are currently closer than 150px horizontally AND closer than 1000ft vertically. (Focus on *current* separation for simplicity).
+3.  **Conflict Detected?** If a pair (A, B) violates *both* horizontal and vertical separation minima:
+    *   **Prioritize Resolution:** This is a conflict. You must act. Handle only ONE conflict per cycle (the first one detected or the most critical if multiple).
+    *   **Check Statuses:** Look at the `status` of both conflicting aircraft (A and B).
+    *   **Determine Who to Vector:**
+        *   If one aircraft (e.g., A) has status `Approaching`, **DO NOT** change its waypoints. You **MUST** vector the other aircraft (B).
+        *   If neither aircraft is `Approaching`, you can choose one to vector (e.g., the one slightly higher, or based on direction, but a simple choice is often sufficient).
+    *   **Calculate Vector:** For the chosen aircraft (let's say B), calculate a *single* new waypoint designed to increase separation. A simple strategy is a 30-45 degree turn away from the other aircraft (A) for a short distance (e.g., 5km ahead on the new heading). Calculate the (x, y) coordinates for this single waypoint. Example: If B is at (1000, 1000) and needs to turn right, a waypoint like (1200, 800) might be suitable.
+    *   **Issue Command:** Use the `SetWaypoints` tool for the chosen aircraft (B) with the single calculated waypoint `[(x, y)]`.
+    *   **Stop:** Do not look for further conflicts in this cycle.
+4.  **No Conflict?** If, after checking all pairs, no aircraft are violating *both* horizontal and vertical separation, state clearly that no conflicts were detected.
+
+**Tool Usage:** ONLY use `SetWaypoints` if a conflict is detected and resolution is needed. Input **MUST** be a Python tuple or list provided *as a single string argument* to the tool, like `'("FLT789", [(1200, 800)])'`.
+
+**Examples of Usage:**
+
+*   **Example 1: Simple Conflict Resolution**
+    *   `Input Scenario:` Active Flights: { "JBU111": {"status": "En Route", "x": 1500, "y": 1500, "altitude": 10000}, "EJA222": {"status": "Following Waypoints", "x": 1550, "y": 1550, "altitude": 10500} }
+    *   `Thought:` 1. Active: JBU111, EJA222. 2. Pair (JBU111, EJA222): Horiz dist = sqrt(50^2+50^2) = 71px. Vert dist = 500ft. 3. Conflict Check: 71px < 150px AND 500ft < 1000ft. YES, conflict! 4. Resolution: Neither is Approaching. Choose to vector EJA222. Turn EJA222 right slightly. Calculate waypoint, e.g., (1700, 1400). 5. Issue command.
+    *   `Action:` `SetWaypoints('("EJA222", [(1700, 1400)])')`
+
+*   **Example 2: Conflict with Approaching Aircraft**
+    *   `Input Scenario:` Active Flights: { "NKS333": {"status": "Approaching", "target_runway": "RW09R", "x": 1000, "y": 3000, "altitude": 2500}, "WJA444": {"status": "En Route", "x": 1100, "y": 2950, "altitude": 3000} }
+    *   `Thought:` 1. Active: NKS333, WJA444. 2. Pair (NKS333, WJA444): Horiz dist = sqrt(100^2+(-50)^2) = sqrt(12500) = 111px. Vert dist = 500ft. 3. Conflict Check: 111px < 150px AND 500ft < 1000ft. YES, conflict! 4. Resolution: NKS333 is `Approaching`. **MUST NOT vector NKS333.** Must vector WJA444. Turn WJA444 away (e.g., south-east). Calculate waypoint, e.g., (1300, 2800). 5. Issue command.
+    *   `Action:` `SetWaypoints('("WJA444", [(1300, 2800)])')`
+
+*   **Example 3: No Conflict Found**
+    *   `Input Scenario:` Active Flights: { "FDX555": {"status": "En Route", "x": 500, "y": 500, "altitude": 31000}, "UPS666": {"status": "En Route", "x": 550, "y": 550, "altitude": 33000} }
+    *   `Thought:` 1. Active: FDX555, UPS666. 2. Pair (FDX555, UPS666): Horiz dist = 71px. Vert dist = 2000ft. 3. Conflict Check: 71px < 150px is TRUE, BUT 2000ft < 1000ft is FALSE. Condition (Both TRUE) is not met. 4. No conflict.
+    *   `Final Answer:` No conflicts detected requiring action.
+
+**Constraint Reminder:** Resolve only ONE conflict per cycle. **NEVER** issue `SetWaypoints` for an aircraft with status `Approaching` if it's involved in a conflict; vector the *other* aircraft instead. Ensure tool inputs are correctly formatted as single strings representing lists/tuples.
+
+Begin!
+
+{agent_scratchpad}
+""" # Use full prompt text
         CONFLICT_PROMPT = ChatPromptTemplate.from_messages([
             ("system", conflict_prompt_template),
             ("human", "{input}"),
@@ -627,13 +678,26 @@ class ATCSimulatorPygame:
                     if distance_to_target <= WAYPOINT_ARRIVAL_THRESHOLD_PX or (dist_covered_this_tick >= distance_to_target and speed_knots > 0.1):
                         # --- LANDING THRESHOLD ARRIVAL ---
                         if is_approaching and wp_index == len(waypoints) - 1:
-                            final_updates['status'] = STATUS_ON_GROUND; final_updates['speed'] = 0.0; final_updates['altitude'] = 0.0
-                            final_updates['waypoints'] = []; final_updates['current_waypoint_index'] = -1
-                            final_updates['x'] = float(target_x); final_updates['y'] = float(target_y) # Snap position
-                            final_updates['target_runway'] = None # Clear target runway
-                            runway_released_this_tick = True
+                            print(f"DEBUG LANDING: {flight_id} reached landing threshold for runway {target_runway_id}")
+                            final_updates['status'] = STATUS_ON_GROUND
+                            final_updates['speed'] = 0.0
+                            final_updates['altitude'] = 0.0
+                            final_updates['waypoints'] = []
+                            final_updates['current_waypoint_index'] = -1
+                            final_updates['x'] = float(target_x)
+                            final_updates['y'] = float(target_y) # Snap position
+                            
+                            # This is critical - make sure we carry the runway ID for release before clearing it
+                            if target_runway_id:  # Store runway ID for release before clearing reference
+                                runway_released_this_tick = True
+                                final_updates['target_runway'] = None  # Clear target runway only after setting flag
+                                updates_to_apply.setdefault(target_runway_id, {})['release_runway'] = flight_id
+                                print(f"DEBUG LANDING: Marking runway {target_runway_id} for release by {flight_id}")
+                            else:
+                                print(f"WARNING: Flight {flight_id} landed but had no target_runway_id!")
+                                
                             speed_knots = 0 # Prevent movement calc below
-                            print(f"DEBUG {flight_id}: Landed on {target_runway_id}.")
+                            print(f"DEBUG {flight_id}: Landed on {target_runway_id}. All landing updates prepared.")
                         # --- REGULAR WAYPOINT ARRIVAL ---
                         else:
                             final_updates['current_waypoint_index'] = wp_index + 1
@@ -707,43 +771,45 @@ class ATCSimulatorPygame:
             if updates_to_apply or flights_to_remove:
                 with self.data_lock:
                     runways_modified = False
-                    # Apply flight updates
-                    for flight_id, updates in updates_to_apply.items():
-                        if flight_id in self.flights:
-                            runway_release_info = updates.pop('release_runway', None) # Check for runway release instruction
-                            self.flights[flight_id].update(updates)
-                            # Handle runway release
-                            if runway_release_info is not None:
-                                # runway_release_info contains the flight_id that *was* using the runway (flight_id here is the runway_id)
-                                runway_id_to_release = flight_id
-                                expected_flight_id = runway_release_info
-                                if runway_id_to_release in self.runways and self.runways[runway_id_to_release].get('flight_id') == expected_flight_id:
-                                     self.runways[runway_id_to_release]['status'] = 'Available'
-                                     self.runways[runway_id_to_release]['flight_id'] = None
-                                     print(f"DEBUG: Runway {runway_id_to_release} released by {expected_flight_id}.")
-                                     runways_modified = True
-                                else:
-                                     print(f"WARN: Could not release runway {runway_id_to_release} for flight {expected_flight_id} (State mismatch?)")
-
+                    # First pass: Collect runway releases
+                    runways_to_release = {}  # Separate runway release tracking
+                    for entity_id, updates in updates_to_apply.items():
+                        release_info = updates.get('release_runway')
+                        if release_info is not None:
+                            # If this is a runway ID with release info
+                            if entity_id in self.runways:
+                                runways_to_release[entity_id] = release_info
+                    
+                    # Second pass: Apply flight updates
+                    for entity_id, updates in updates_to_apply.items():
+                        if entity_id in self.flights:
+                            # This is a flight update
+                            updates_copy = updates.copy()
+                            updates_copy.pop('release_runway', None)  # Remove release instruction if present
+                            self.flights[entity_id].update(updates_copy)
+                    
+                    # Third pass: Process runway releases
+                    for runway_id, flight_id in runways_to_release.items():
+                        if runway_id in self.runways and self.runways[runway_id].get('flight_id') == flight_id:
+                            # Release the runway if it's still assigned to this flight
+                            self.runways[runway_id]['status'] = 'Available'
+                            self.runways[runway_id]['flight_id'] = None
+                            print(f"DEBUG: Runway {runway_id} released by {flight_id} (landing completed).")
+                            runways_modified = True
+                        else:
+                            print(f"WARN: Could not release runway {runway_id} for flight {flight_id} (State mismatch)")
 
                     # Remove flights
-                    state_changed = False
                     for flight_id in flights_to_remove:
                         if flight_id in self.flights:
-                            # Ensure runway is released if flight is removed unexpectedly
+                            # Check and release any assigned runway for removed flight
                             target_runway = self.flights[flight_id].get('target_runway')
                             if target_runway and target_runway in self.runways and self.runways[target_runway].get('flight_id') == flight_id:
-                                 self.runways[target_runway]['status'] = 'Available'
-                                 self.runways[target_runway]['flight_id'] = None
-                                 print(f"INFO: Runway {target_runway} released by removed flight {flight_id}.")
-                                 runways_modified = True
+                                self.runways[target_runway]['status'] = 'Available'
+                                self.runways[target_runway]['flight_id'] = None
+                                print(f"INFO: Runway {target_runway} released due to flight {flight_id} removal.")
                             del self.flights[flight_id]
-                            state_changed = True
-
-                    # Save data if structure changed (or maybe periodically?)
-                    # If saving is too frequent, move it elsewhere
-                    # if state_changed or runways_modified:
-                    #     self.save_data() # Consider if saving needed after every minor update
+                            print(f"INFO: Flight {flight_id} removed from simulation.")
 
             # Short sleep to prevent CPU hogging if updates are very fast
             time.sleep(0.01) # Sleep even if no updates happened
@@ -1015,9 +1081,9 @@ class ATCSimulatorPygame:
                 # Add keyboard handling here later if needed (e.g., run agents manually)
 
             # --- Random Flight Check (approx every minute) ---
-            if current_loop_time - self.last_random_flight_check_time > 60.0:
+            if current_loop_time - self.last_random_flight_check_time > 15.0:
                 print("Checking for random flight addition...")
-                if random.randint(1, 1000) == 1:
+                if random.randint(1, 8) == 1:
                     self._add_random_flight()
                 self.last_random_flight_check_time = current_loop_time # Reset timer
 
